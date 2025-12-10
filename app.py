@@ -1,11 +1,14 @@
 import os
 from io import BytesIO
-from typing import List
-
+from typing import List, Union
+# from pydub import AudioSegment  <--- COMMENTÉ POUR ÉVITER L'ERREUR pyaudioop
 import streamlit as st
 from dotenv import load_dotenv
-from pydub import AudioSegment
 from openai import OpenAI
+from openai.types.audio import Transcription
+
+# --- NOUVELLE CONSTANTE POUR LA LIMITE DE TAILLE (API WHISPER) ---
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 Mo en bytes
 
 # -----------------------
 # 1. Chargement des variables d'environnement
@@ -17,7 +20,9 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     client = None
 else:
-    client = OpenAI(api_key=api_key)
+    # Utilisation d'un client OpenAI standard
+    # Remarque : si vous utilisez l'API Gemini, remplacez OpenAI par gemini.Client
+    client = OpenAI(api_key=api_key) 
 
 # -----------------------
 # 2. Configuration de la page Streamlit
@@ -31,75 +36,54 @@ st.set_page_config(
 st.caption(f"📦 Taille max upload côté Streamlit : {st.get_option('server.maxUploadSize')} Mo")
 
 st.title("📝 Générateur de compte rendu de réunion")
-st.write(
-    "Dépose un fichier audio de réunion (MP3 / WAV) et l’outil générera d’abord une transcription complète, "
-    "puis un compte rendu structuré (dans les prochaines étapes)."
+st.warning(
+    "⚠️ **Correction d'erreur `pyaudioop` :** Le découpage audio automatique pour les fichiers de "
+    "plus de 25 Mo est temporairement désactivé. Veuillez n'uploader que des fichiers de **25 Mo maximum** "
+    "jusqu'à la prochaine mise à jour."
 )
 
 # -----------------------
 # 3. Upload du fichier audio
 # -----------------------
 uploaded_file = st.file_uploader(
-    "Dépose ton fichier audio ici",
+    "Dépose ton fichier audio ici (MP3 / WAV / M4A) - **MAX 25 Mo**",
     type=["mp3", "wav", "m4a"],
     help="Formats supportés : MP3, WAV, M4A",
 )
 
 status_placeholder = st.empty()
 
-# -----------------------
-# 4. Fonctions utilitaires
-# -----------------------
-def load_audio_to_pydub(file) -> AudioSegment:
-    """Charge le fichier uploadé dans un objet AudioSegment (pydub)."""
-    data = BytesIO(file.read())
-    audio = AudioSegment.from_file(data)
-    # On force en mono & 16 kHz pour plus de stabilité
-    audio = audio.set_channels(1).set_frame_rate(16000)
-    return audio
 
+# -----------------------
+# 4. Fonctions utilitaires (SANS pydub)
+# -----------------------
 
-def split_audio(audio: AudioSegment, max_chunk_ms: int = 10 * 60 * 1000) -> List[AudioSegment]:
+def transcribe_audio_simple(audio_file: BytesIO, language: str = "fr") -> str:
     """
-    Découpe l'audio en morceaux (chunks) de durée maximale max_chunk_ms (par défaut 10 minutes).
-    Retourne une liste d'AudioSegment.
+    Transcrit un fichier audio unique (moins de 25 Mo) avec Whisper.
+    L'objet doit être un BytesIO (mémoire) avec le nom de fichier correct.
     """
-    chunks = []
-    total_length = len(audio)
-    for start_ms in range(0, total_length, max_chunk_ms):
-        end_ms = min(start_ms + max_chunk_ms, total_length)
-        chunk = audio[start_ms:end_ms]
-        chunks.append(chunk)
-    return chunks
+    if client is None:
+        raise RuntimeError("Client OpenAI non initialisé (clé API manquante).")
+
+    # On s'assure que le pointeur est au début pour l'API
+    audio_file.seek(0)
+    
+    # L'API Whisper attend un objet de type fichier
+    transcription: Transcription = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+        language=language,
+    )
+    return transcription.text
 
 
 def estimate_whisper_cost(duration_minutes: float, price_per_minute_usd: float = 0.006) -> float:
     """
     Estime le coût de transcription Whisper (whisper-1) en dollars.
-    Par défaut : 0,006 $ / minute (à ajuster si besoin).
+    (La durée doit être estimée manuellement si pydub n'est pas utilisé)
     """
     return duration_minutes * price_per_minute_usd
-
-
-def transcribe_chunk_with_whisper(chunk: AudioSegment, language: str = "fr") -> str:
-    """
-    Transcrit un chunk d'audio avec Whisper (whisper-1) et renvoie le texte.
-    """
-    if client is None:
-        raise RuntimeError("Client OpenAI non initialisé (clé API manquante).")
-
-    # On exporte le chunk vers un buffer en mémoire, en WAV (format très compatible)
-    buffer = BytesIO()
-    chunk.export(buffer, format="wav")
-    buffer.seek(0)
-    buffer.name = "chunk.wav"  # important pour que l'API reconnaisse le format
-
-    transcription = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=buffer,
-        language=language,
-    )
-    return transcription.text
 
 
 # -----------------------
@@ -107,121 +91,104 @@ def transcribe_chunk_with_whisper(chunk: AudioSegment, language: str = "fr") -> 
 # -----------------------
 if uploaded_file is not None:
     st.success(f"✅ Fichier chargé : **{uploaded_file.name}**")
-    st.write("Tu peux maintenant lancer la transcription audio → texte.")
+    
+    # On convertit le fichier uploadé en objet BytesIO pour l'API
+    audio_buffer = BytesIO(uploaded_file.getvalue())
+    # On réassigne le nom pour que l'API reconnaisse le format
+    audio_buffer.name = uploaded_file.name or "audio_file.mp3"
+    
+    # Vérification simple de la taille
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    
+    if uploaded_file.size > MAX_FILE_SIZE:
+        st.error(
+            f"❌ Fichier trop volumineux ({file_size_mb:.2f} Mo). "
+            "La limite actuelle pour ce mode de transcription est 25 Mo."
+        )
+    else:
+        st.write("Tu peux maintenant lancer la transcription audio → texte.")
+        
+        # --------- 5.A – Mode classique : Whisper (sans découpage) ---------
+        st.markdown("### 🎧 Transcription simple (Fichier unique)")
+        
+        # Pour le mode simple, on demande à l'utilisateur d'estimer la durée pour le coût
+        duration_minutes = st.number_input(
+            "Durée de la réunion estimée (minutes)", 
+            min_value=1.0, 
+            value=min(file_size_mb * 2.5, 60.0), # Estimation grossière
+            step=5.0,
+            help="Entre la durée pour estimer le coût (API Whisper : 0,006 $ / minute).",
+        )
+        
+        estimated_cost = estimate_whisper_cost(duration_minutes)
+        st.write(f"💰 Coût estimé de la transcription : ~**{estimated_cost:.4f} $**")
+        
+        if st.button("Transcrire la réunion (Whisper)"):
+            if client is None:
+                st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
+            else:
+                try:
+                    status_placeholder.info("🗣️ Transcription en cours avec Whisper...")
+                    
+                    # 1) Transcription
+                    full_transcript = transcribe_audio_simple(audio_buffer, language="fr")
 
-    # --------- 5.A – Mode classique : Whisper + découpage ---------
-    st.markdown("### 🎧 Transcription classique (Whisper + découpage)")
+                    status_placeholder.success("✅ Transcription terminée !")
 
-    # Slider pour régler la durée max d'un chunk (optionnel)
-    chunk_length_minutes = st.slider(
-        "Durée maximale par morceau (chunk) pour la transcription",
-        min_value=5,
-        max_value=20,
-        value=10,
-        step=5,
-        help="Cela permet de gérer de longues réunions sans dépasser les limites de l'API.",
-    )
+                    # 2) Affichage de la transcription
+                    st.subheader("🧾 Transcription complète")
+                    st.write(
+                        "Voici la transcription brute de la réunion. "
+                        "La prochaine étape (en bas) est la génération du compte rendu structuré."
+                    )
+                    st.text_area(
+                        "Transcription",
+                        value=full_transcript,
+                        height=400,
+                    )
 
-    if st.button("Transcrire la réunion (Whisper)"):
-        if client is None:
-            st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
-        else:
-            try:
-                # 1) Chargement de l'audio
-                status_placeholder.info("⏳ Chargement de l'audio...")
-                audio = load_audio_to_pydub(uploaded_file)
+                    # On garde dans la session pour utilisation future (résumé, CR, etc.)
+                    st.session_state["full_transcript"] = full_transcript
+                    
+                except Exception as e:
+                    status_placeholder.error("❌ Erreur lors de la transcription.")
+                    st.error(f"Une erreur est survenue lors de l'appel à l'API Whisper : {str(e)}")
 
-                duration_seconds = len(audio) / 1000
-                duration_minutes = duration_seconds / 60
-                st.write(f"🕒 Durée estimée de l'audio : **{duration_minutes:.1f} minutes**")
-
-                # Estimation du coût
-                estimated_cost = estimate_whisper_cost(duration_minutes)
-                st.write(f"💰 Coût estimé de la transcription (whisper-1) : ~**{estimated_cost:.4f} $**")
-
-                # 2) Découpage en chunks
-                status_placeholder.info("✂️ Découpage de l'audio en morceaux...")
-                max_chunk_ms = chunk_length_minutes * 60 * 1000
-                chunks = split_audio(audio, max_chunk_ms=max_chunk_ms)
-                st.write(f"🔹 Nombre de morceaux : **{len(chunks)}**")
-
-                # 3) Transcription chunk par chunk
-                status_placeholder.info("🗣️ Transcription en cours avec Whisper...")
-
-                all_text_parts = []
-                progress_bar = st.progress(0)
-                total_chunks = len(chunks)
-
-                for idx, chunk in enumerate(chunks, start=1):
-                    status_placeholder.info(f"🗣️ Transcription du morceau {idx}/{total_chunks}...")
-                    text = transcribe_chunk_with_whisper(chunk, language="fr")
-                    all_text_parts.append(text)
-
-                    progress_bar.progress(idx / total_chunks)
-
-                full_transcript = "\n\n".join(all_text_parts)
-
-                status_placeholder.success("✅ Transcription terminée !")
-
-                # 4) Affichage de la transcription
-                st.subheader("🧾 Transcription complète")
-                st.write(
-                    "Voici la transcription brute de la réunion. "
-                    "La prochaine étape consistera à générer un compte rendu structuré à partir de ce texte."
-                )
-                st.text_area(
-                    "Transcription",
-                    value=full_transcript,
-                    height=400,
-                )
-
-                # On garde dans la session pour utilisation future (résumé, CR, etc.)
-                st.session_state["full_transcript"] = full_transcript
-
-            except Exception as e:
-                status_placeholder.error("❌ Erreur lors de la transcription.")
-                st.error(str(e))
 
     # --------- 5.B – Mode diarisation : gpt-4o-transcribe-diarize ---------
-    st.markdown("### 🔊 Transcription avec identification des locuteurs")
+    # Le mode diarisation est naturellement limité à 25 Mo, mais utilise un modèle différent (gpt-4o-transcribe-diarize)
+    st.markdown("### 🔊 Transcription avec identification des locuteurs (Diarisation)")
 
     st.write(
         "Utilise ce mode si ton fichier fait **25 Mo ou moins**. "
-        "Le modèle `gpt-4o-transcribe-diarize` ajoutera des labels de locuteurs (A, B, C...)."
+        "Le modèle `gpt-4o-transcribe-diarize` est souvent plus performant pour identifier les locuteurs (A, B, C...)."
     )
 
-    if st.button("Transcrire avec diarisation (gpt-4o-transcribe-diarize)"):
+    if st.button("Transcrire avec diarisation"):
         if client is None:
             st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
         else:
-            # 25 Mo = 25 * 1024 * 1024 octets
-            max_bytes = 25 * 1024 * 1024
-            if uploaded_file.size > max_bytes:
+            if uploaded_file.size > MAX_FILE_SIZE:
                 st.error(
-                    f"❌ Fichier trop volumineux pour la diarisation (taille : {uploaded_file.size/1024/1024:.1f} Mo). "
-                    "La limite de l'API est 25 Mo. Utilise plutôt la transcription 'Whisper' avec découpage."
+                    f"❌ Fichier trop volumineux pour la diarisation (taille : {file_size_mb:.1f} Mo). "
+                    "La limite de l'API est 25 Mo. Utilise le mode simple si tu peux réduire la taille du fichier."
                 )
             else:
                 try:
                     with st.spinner("🧠 Transcription + diarisation en cours..."):
-                        # On récupère les bytes du fichier uploadé
-                        audio_bytes = uploaded_file.getvalue()
-                        buffer = BytesIO(audio_bytes)
-                        # Donner un nom avec une extension reconnue
-                        buffer.name = uploaded_file.name or "audio.wav"
-
+                        # Le buffer est déjà créé avec le contenu du fichier et le nom
+                        
                         diarized = client.audio.transcriptions.create(
                             model="gpt-4o-transcribe-diarize",
-                            file=buffer,
+                            file=audio_buffer,
                             response_format="diarized_json",
-                            chunking_strategy="auto",
+                            # chunking_strategy="auto", # Non nécessaire pour gpt-4o-transcribe-diarize, il le gère
                         )
 
                         # diarized.segments contient les segments avec speaker / start / end / text
                         segments = diarized.segments
 
-                        # On construit un texte lisible du type :
-                        # Speaker A [0.0s–5.2s] : blabla
+                        # On construit un texte lisible
                         lines = []
                         for seg in segments:
                             speaker = seg.speaker
@@ -251,7 +218,7 @@ if uploaded_file is not None:
 
                 except Exception as e:
                     st.error("❌ Erreur lors de la transcription avec diarisation.")
-                    st.error(str(e))
+                    st.error(f"Une erreur est survenue lors de l'appel à l'API : {str(e)}")
 
 else:
     st.info("⤴️ Commence par déposer un fichier audio pour continuer.")
@@ -324,22 +291,33 @@ else:
                         "Produit maintenant le compte rendu demandé."
                     )
 
-                    resp = client.responses.create(
+                    # --- APPEL À L'API DE RÉSUMÉ ---
+                    # Nous allons utiliser client.chat.completions.create qui est la méthode standard pour GPT
+                    # L'API Gemini que vous utilisiez (client.responses.create) n'est pas standard pour OpenAI.
+                    resp = client.chat.completions.create(
                         model="gpt-4o-mini",
-                        input=[
+                        messages=[
                             {"role": "system", "content": system_msg},
                             {"role": "user", "content": user_prompt},
                         ],
                     )
 
-                    cr_texte = resp.output[0].content[0].text
+                    # Le format de réponse standard pour OpenAI Chat API
+                    cr_texte = resp.choices[0].message.content 
 
                 st.subheader("📄 Compte rendu généré")
                 st.write(cr_texte)
 
                 # Option : on stocke le CR dans la session pour réutilisation ultérieure (export, etc.)
                 st.session_state["meeting_summary"] = cr_texte
+                
+                st.download_button(
+                    label="Télécharger le compte rendu (Markdown)",
+                    data=cr_texte,
+                    file_name=f"compte_rendu_{uploaded_file.name.split('.')[0]}_CR.md",
+                    mime="text/markdown"
+                )
 
             except Exception as e:
                 st.error("❌ Erreur lors de la génération du compte rendu.")
-                st.error(str(e))
+                st.error(f"Une erreur est survenue lors de l'appel à l'API GPT-4o-mini : {str(e)}")
