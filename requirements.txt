@@ -1,4 +1,4 @@
 streamlit
 openai
-pydub==0.24.1
+pydub==0.25.1
 python-dotenv
