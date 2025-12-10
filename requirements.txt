@@ -2,4 +2,3 @@ streamlit
 openai
 pydub
 python-dotenv
-pyaudioop
