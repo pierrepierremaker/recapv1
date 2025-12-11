@@ -8,15 +8,17 @@ from openai import OpenAI
 
 from utils.ui import ui_header, ui_sidebar
 from utils.audio import prepare_audio
-from utils.transcription import transcribe_whisper, transcribe_diarized
+from utils.transcription import transcribe_whisper  # plus de diarisation ici
 from utils.export import export_docx, export_pdf
 
-# Chargement .env et client OpenAI
+
+# -----------------------
+# 0. Config OpenAI & UI
+# -----------------------
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=api_key) if api_key else None
 
-# 🎨 UI générale
 ui_header()
 ui_sidebar()
 
@@ -25,7 +27,6 @@ ui_sidebar()
 # -----------------------
 st.subheader("🧾 Informations sur la réunion")
 
-# Initialisation dans la session
 if "meta" not in st.session_state:
     st.session_state["meta"] = {
         "title": "",
@@ -40,7 +41,6 @@ col1, col2 = st.columns(2)
 with col1:
     title = st.text_input("Titre de la réunion", value=meta.get("title", ""))
 with col2:
-    # On stocke la date comme string dans la session pour simplifier la sérialisation
     default_date = datetime.date.fromisoformat(meta.get("date")) if meta.get("date") else datetime.date.today()
     meeting_date = st.date_input("Date", value=default_date)
 
@@ -51,20 +51,18 @@ participants = st.text_area(
     help="Liste des participants (séparés par des virgules ou des retours à la ligne).",
 )
 
-# Mise à jour session
 st.session_state["meta"] = {
     "title": title.strip(),
     "date": meeting_date.isoformat(),
     "location": location.strip(),
     "participants": participants.strip(),
 }
-
-meta = st.session_state["meta"]  # re-récupéré à jour
+meta = st.session_state["meta"]
 
 st.markdown("---")
 
 # -----------------------
-# 2. Upload et transcription audio
+# 2. Upload & transcription Whisper simple
 # -----------------------
 st.subheader("⬆️ Importer un fichier audio")
 
@@ -79,20 +77,11 @@ if uploaded_file and not client:
 if uploaded_file and client:
     try:
         audio_buffer = prepare_audio(uploaded_file)
-        st.success("✅ Fichier prêt pour transcription")
+        st.success("✅ Fichier prêt pour transcription (Whisper-1)")
 
-        mode = st.radio(
-            "Mode de transcription",
-            ["Whisper (simple)", "Diarisation (locuteurs)"],
-            horizontal=True,
-        )
-
-        if st.button("🎧 Lancer la transcription"):
-            with st.spinner("Transcription en cours…"):
-                if mode == "Whisper (simple)":
-                    transcript = transcribe_whisper(client, audio_buffer)
-                else:
-                    transcript = transcribe_diarized(client, audio_buffer)
+        if st.button("🎧 Lancer la transcription (Whisper-1)"):
+            with st.spinner("Transcription en cours avec Whisper-1…"):
+                transcript = transcribe_whisper(client, audio_buffer)
 
             st.success("✅ Transcription terminée !")
             st.session_state["transcript"] = transcript
@@ -136,7 +125,6 @@ else:
                 "Procès-verbal": "Rédige un procès-verbal détaillé, chronologique, fidèle au contenu.",
             }
 
-            # Construction d’un bloc texte avec les métadonnées
             meta_block = (
                 f"Titre de la réunion : {meta.get('title') or 'Non précisé'}\n"
                 f"Date : {meta.get('date') or 'Non précisé'}\n"
@@ -170,7 +158,6 @@ else:
 
         st.markdown("### 📥 Export")
 
-        # Exports avec métadonnées
         docx_file = export_docx(summary, meta)
         st.download_button(
             "📄 Télécharger en DOCX",
