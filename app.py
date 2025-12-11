@@ -1,323 +1,188 @@
 import os
+import datetime
 from io import BytesIO
-from typing import List, Union
-# from pydub import AudioSegment  <--- COMMENTÉ POUR ÉVITER L'ERREUR pyaudioop
+
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai.types.audio import Transcription
 
-# --- NOUVELLE CONSTANTE POUR LA LIMITE DE TAILLE (API WHISPER) ---
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 Mo en bytes
+from utils.ui import ui_header, ui_sidebar
+from utils.audio import prepare_audio
+from utils.transcription import transcribe_whisper, transcribe_diarized
+from utils.export import export_docx, export_pdf
 
-# -----------------------
-# 1. Chargement des variables d'environnement
-# -----------------------
+# Chargement .env et client OpenAI
 load_dotenv()
-
 api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key) if api_key else None
 
-if not api_key:
-    client = None
-else:
-    # Utilisation d'un client OpenAI standard
-    # Remarque : si vous utilisez l'API Gemini, remplacez OpenAI par gemini.Client
-    client = OpenAI(api_key=api_key) 
+# 🎨 UI générale
+ui_header()
+ui_sidebar()
 
 # -----------------------
-# 2. Configuration de la page Streamlit
+# 1. Formulaire métadonnées réunion
 # -----------------------
-st.set_page_config(
-    page_title="Compte rendu de réunion automatique",
-    page_icon="📝",
-    layout="centered",
+st.subheader("🧾 Informations sur la réunion")
+
+# Initialisation dans la session
+if "meta" not in st.session_state:
+    st.session_state["meta"] = {
+        "title": "",
+        "date": str(datetime.date.today()),
+        "location": "",
+        "participants": "",
+    }
+
+meta = st.session_state["meta"]
+
+col1, col2 = st.columns(2)
+with col1:
+    title = st.text_input("Titre de la réunion", value=meta.get("title", ""))
+with col2:
+    # On stocke la date comme string dans la session pour simplifier la sérialisation
+    default_date = datetime.date.fromisoformat(meta.get("date")) if meta.get("date") else datetime.date.today()
+    meeting_date = st.date_input("Date", value=default_date)
+
+location = st.text_input("Lieu", value=meta.get("location", ""))
+participants = st.text_area(
+    "Participants",
+    value=meta.get("participants", ""),
+    help="Liste des participants (séparés par des virgules ou des retours à la ligne).",
 )
 
-st.caption(f"📦 Taille max upload côté Streamlit : {st.get_option('server.maxUploadSize')} Mo")
+# Mise à jour session
+st.session_state["meta"] = {
+    "title": title.strip(),
+    "date": meeting_date.isoformat(),
+    "location": location.strip(),
+    "participants": participants.strip(),
+}
 
-st.title("📝 Générateur de compte rendu de réunion")
-st.warning(
-    "⚠️ **Correction d'erreur `pyaudioop` :** Le découpage audio automatique pour les fichiers de "
-    "plus de 25 Mo est temporairement désactivé. Veuillez n'uploader que des fichiers de **25 Mo maximum** "
-    "jusqu'à la prochaine mise à jour."
-)
+meta = st.session_state["meta"]  # re-récupéré à jour
 
-# -----------------------
-# 3. Upload du fichier audio
-# -----------------------
-uploaded_file = st.file_uploader(
-    "Dépose ton fichier audio ici (MP3 / WAV / M4A) - **MAX 25 Mo**",
-    type=["mp3", "wav", "m4a"],
-    help="Formats supportés : MP3, WAV, M4A",
-)
-
-status_placeholder = st.empty()
-
-
-# -----------------------
-# 4. Fonctions utilitaires (SANS pydub)
-# -----------------------
-
-def transcribe_audio_simple(audio_file: BytesIO, language: str = "fr") -> str:
-    """
-    Transcrit un fichier audio unique (moins de 25 Mo) avec Whisper.
-    L'objet doit être un BytesIO (mémoire) avec le nom de fichier correct.
-    """
-    if client is None:
-        raise RuntimeError("Client OpenAI non initialisé (clé API manquante).")
-
-    # On s'assure que le pointeur est au début pour l'API
-    audio_file.seek(0)
-    
-    # L'API Whisper attend un objet de type fichier
-    transcription: Transcription = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=audio_file,
-        language=language,
-    )
-    return transcription.text
-
-
-def estimate_whisper_cost(duration_minutes: float, price_per_minute_usd: float = 0.006) -> float:
-    """
-    Estime le coût de transcription Whisper (whisper-1) en dollars.
-    (La durée doit être estimée manuellement si pydub n'est pas utilisé)
-    """
-    return duration_minutes * price_per_minute_usd
-
-
-# -----------------------
-# 5. Interface principale
-# -----------------------
-if uploaded_file is not None:
-    st.success(f"✅ Fichier chargé : **{uploaded_file.name}**")
-    
-    # On convertit le fichier uploadé en objet BytesIO pour l'API
-    audio_buffer = BytesIO(uploaded_file.getvalue())
-    # On réassigne le nom pour que l'API reconnaisse le format
-    audio_buffer.name = uploaded_file.name or "audio_file.mp3"
-    
-    # Vérification simple de la taille
-    file_size_mb = uploaded_file.size / (1024 * 1024)
-    
-    if uploaded_file.size > MAX_FILE_SIZE:
-        st.error(
-            f"❌ Fichier trop volumineux ({file_size_mb:.2f} Mo). "
-            "La limite actuelle pour ce mode de transcription est 25 Mo."
-        )
-    else:
-        st.write("Tu peux maintenant lancer la transcription audio → texte.")
-        
-        # --------- 5.A – Mode classique : Whisper (sans découpage) ---------
-        st.markdown("### 🎧 Transcription simple (Fichier unique)")
-        
-        # Pour le mode simple, on demande à l'utilisateur d'estimer la durée pour le coût
-        duration_minutes = st.number_input(
-            "Durée de la réunion estimée (minutes)", 
-            min_value=1.0, 
-            value=min(file_size_mb * 2.5, 60.0), # Estimation grossière
-            step=5.0,
-            help="Entre la durée pour estimer le coût (API Whisper : 0,006 $ / minute).",
-        )
-        
-        estimated_cost = estimate_whisper_cost(duration_minutes)
-        st.write(f"💰 Coût estimé de la transcription : ~**{estimated_cost:.4f} $**")
-        
-        if st.button("Transcrire la réunion (Whisper)"):
-            if client is None:
-                st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
-            else:
-                try:
-                    status_placeholder.info("🗣️ Transcription en cours avec Whisper...")
-                    
-                    # 1) Transcription
-                    full_transcript = transcribe_audio_simple(audio_buffer, language="fr")
-
-                    status_placeholder.success("✅ Transcription terminée !")
-
-                    # 2) Affichage de la transcription
-                    st.subheader("🧾 Transcription complète")
-                    st.write(
-                        "Voici la transcription brute de la réunion. "
-                        "La prochaine étape (en bas) est la génération du compte rendu structuré."
-                    )
-                    st.text_area(
-                        "Transcription",
-                        value=full_transcript,
-                        height=400,
-                    )
-
-                    # On garde dans la session pour utilisation future (résumé, CR, etc.)
-                    st.session_state["full_transcript"] = full_transcript
-                    
-                except Exception as e:
-                    status_placeholder.error("❌ Erreur lors de la transcription.")
-                    st.error(f"Une erreur est survenue lors de l'appel à l'API Whisper : {str(e)}")
-
-
-    # --------- 5.B – Mode diarisation : gpt-4o-transcribe-diarize ---------
-    # Le mode diarisation est naturellement limité à 25 Mo, mais utilise un modèle différent (gpt-4o-transcribe-diarize)
-    st.markdown("### 🔊 Transcription avec identification des locuteurs (Diarisation)")
-
-    st.write(
-        "Utilise ce mode si ton fichier fait **25 Mo ou moins**. "
-        "Le modèle `gpt-4o-transcribe-diarize` est souvent plus performant pour identifier les locuteurs (A, B, C...)."
-    )
-
-    if st.button("Transcrire avec diarisation"):
-        if client is None:
-            st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
-        else:
-            if uploaded_file.size > MAX_FILE_SIZE:
-                st.error(
-                    f"❌ Fichier trop volumineux pour la diarisation (taille : {file_size_mb:.1f} Mo). "
-                    "La limite de l'API est 25 Mo. Utilise le mode simple si tu peux réduire la taille du fichier."
-                )
-            else:
-                try:
-                    with st.spinner("🧠 Transcription + diarisation en cours..."):
-                        # Le buffer est déjà créé avec le contenu du fichier et le nom
-                        
-                        diarized = client.audio.transcriptions.create(
-                            model="gpt-4o-transcribe-diarize",
-                            file=audio_buffer,
-                            response_format="diarized_json",
-                            # chunking_strategy="auto", # Non nécessaire pour gpt-4o-transcribe-diarize, il le gère
-                        )
-
-                        # diarized.segments contient les segments avec speaker / start / end / text
-                        segments = diarized.segments
-
-                        # On construit un texte lisible
-                        lines = []
-                        for seg in segments:
-                            speaker = seg.speaker
-                            start = getattr(seg, "start", None)
-                            end = getattr(seg, "end", None)
-                            text = seg.text
-
-                            if start is not None and end is not None:
-                                lines.append(
-                                    f"Speaker {speaker} [{start:.1f}s–{end:.1f}s] : {text}"
-                                )
-                            else:
-                                lines.append(f"Speaker {speaker} : {text}")
-
-                        labeled_transcript = "\n".join(lines)
-
-                        st.success("✅ Transcription diarisée terminée !")
-                        st.subheader("🧾 Transcription avec locuteurs")
-                        st.text_area(
-                            "Texte diarisé (qui parle, quand, quoi)",
-                            value=labeled_transcript,
-                            height=400,
-                        )
-
-                        # On garde ça dans la session pour le futur compte rendu
-                        st.session_state["full_transcript"] = labeled_transcript
-
-                except Exception as e:
-                    st.error("❌ Erreur lors de la transcription avec diarisation.")
-                    st.error(f"Une erreur est survenue lors de l'appel à l'API : {str(e)}")
-
-else:
-    st.info("⤴️ Commence par déposer un fichier audio pour continuer.")
-
-# -----------------------
-# 6. Génération du compte rendu avec GPT-4o-mini
-# -----------------------
 st.markdown("---")
-st.subheader("🧠 Générer un compte rendu de la réunion")
 
-if "full_transcript" not in st.session_state:
-    st.info("➡️ Transcris d'abord une réunion (avec ou sans diarisation) pour pouvoir générer un compte rendu.")
-else:
-    transcript_text = st.session_state["full_transcript"]
+# -----------------------
+# 2. Upload et transcription audio
+# -----------------------
+st.subheader("⬆️ Importer un fichier audio")
 
-    st.write(
-        "À partir de la transcription ci-dessus, l’outil va produire un compte rendu synthétique, "
-        "structuré par thèmes et par intervenant."
-    )
+uploaded_file = st.file_uploader(
+    "Choisis un fichier (MP3 / WAV / M4A / AAC / AMR)",
+    type=["mp3", "wav", "m4a", "aac", "amr"],
+)
 
-    # Optionnel : rappel de la transcription (extrait)
-    with st.expander("Voir un extrait de la transcription utilisée"):
-        st.text_area(
-            "Transcription (extrait)",
-            value=transcript_text[:2000] + ("..." if len(transcript_text) > 2000 else ""),
-            height=200,
+if uploaded_file and not client:
+    st.error("❌ Aucune clé OPENAI_API_KEY détectée dans ton .env")
+
+if uploaded_file and client:
+    try:
+        audio_buffer = prepare_audio(uploaded_file)
+        st.success("✅ Fichier prêt pour transcription")
+
+        mode = st.radio(
+            "Mode de transcription",
+            ["Whisper (simple)", "Diarisation (locuteurs)"],
+            horizontal=True,
         )
 
+        if st.button("🎧 Lancer la transcription"):
+            with st.spinner("Transcription en cours…"):
+                if mode == "Whisper (simple)":
+                    transcript = transcribe_whisper(client, audio_buffer)
+                else:
+                    transcript = transcribe_diarized(client, audio_buffer)
+
+            st.success("✅ Transcription terminée !")
+            st.session_state["transcript"] = transcript
+
+            st.text_area("🧾 Transcription", transcript, height=300)
+
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la préparation ou de la transcription : {e}")
+
+elif not uploaded_file:
+    st.info("⤴️ Dépose un fichier audio pour commencer.")
+
+st.markdown("---")
+
+# -----------------------
+# 3. Génération du compte rendu
+# -----------------------
+st.subheader("🧠 Générer le compte rendu")
+
+if "transcript" not in st.session_state:
+    st.info("➡️ Transcris d'abord une réunion pour pouvoir générer un compte rendu.")
+else:
     style = st.selectbox(
         "Style de compte rendu",
-        ["Professionnel / neutre", "Bullet points synthétiques", "Version détaillée (procès-verbal)"],
-        index=0,
+        ["Professionnel", "Bullet Points", "Procès-verbal"],
     )
 
     if st.button("✨ Générer le compte rendu"):
-        if client is None:
-            st.error("❌ Aucune clé API OpenAI détectée. Configure OPENAI_API_KEY pour continuer.")
-        else:
-            try:
-                with st.spinner("🧠 Rédaction du compte rendu en cours..."):
-                    # On adapte un peu le ton selon le style choisi
-                    if style == "Professionnel / neutre":
-                        style_instruction = (
-                            "Rédige un compte rendu professionnel, neutre, bien structuré, en français, "
-                            "avec des titres et sous-titres clairs."
-                        )
-                    elif style == "Bullet points synthétiques":
-                        style_instruction = (
-                            "Fais un résumé très synthétique sous forme de listes à puces, en français, "
-                            "en mettant surtout en avant les idées clés et les chiffres importants."
-                        )
-                    else:  # Version détaillée (procès-verbal)
-                        style_instruction = (
-                            "Rédige un compte rendu détaillé, proche d'un procès-verbal, en français, "
-                            "en respectant fidèlement le contenu sans inventer de faits."
-                        )
+        transcript = st.session_state["transcript"]
 
-                    system_msg = (
-                        "Tu es un assistant chargé de rédiger des comptes rendus de réunions à partir de transcriptions. "
-                        "Tu dois être clair, structuré, fidèle au contenu, et ne pas inventer de décisions ou de chiffres. "
-                        "Lorsque la transcription contient des étiquettes de locuteur comme 'Speaker A' ou 'Speaker B', "
-                        "explique dans le compte rendu qui semble être qui (ex : intervieweur, invité, expert...), "
-                        "sans inventer d'identité réelle."
-                    )
+        with st.spinner("Rédaction du compte rendu…"):
+            system_msg = (
+                "Tu es un assistant spécialisé dans la rédaction de comptes rendus de réunion. "
+                "Tu dois être clair, structuré, factuel et ne pas inventer de décisions, de chiffres, "
+                "ni de participants qui ne figurent pas dans les informations fournies."
+            )
 
-                    user_prompt = (
-                        f"{style_instruction}\n\n"
-                        "Voici la transcription de l'échange (avec éventuellement des labels de locuteurs) :\n\n"
-                        f"{transcript_text}\n\n"
-                        "Produit maintenant le compte rendu demandé."
-                    )
+            style_instructions = {
+                "Professionnel": "Rédige un compte rendu clair, structuré, professionnel, avec des titres et sous-titres.",
+                "Bullet Points": "Rédige un résumé synthétique en listes à puces, axé sur les décisions, actions et points clés.",
+                "Procès-verbal": "Rédige un procès-verbal détaillé, chronologique, fidèle au contenu.",
+            }
 
-                    # --- APPEL À L'API DE RÉSUMÉ ---
-                    # Nous allons utiliser client.chat.completions.create qui est la méthode standard pour GPT
-                    # L'API Gemini que vous utilisiez (client.responses.create) n'est pas standard pour OpenAI.
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": system_msg},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    )
+            # Construction d’un bloc texte avec les métadonnées
+            meta_block = (
+                f"Titre de la réunion : {meta.get('title') or 'Non précisé'}\n"
+                f"Date : {meta.get('date') or 'Non précisé'}\n"
+                f"Lieu : {meta.get('location') or 'Non précisé'}\n"
+                f"Participants : {meta.get('participants') or 'Non précisé'}\n"
+            )
 
-                    # Le format de réponse standard pour OpenAI Chat API
-                    cr_texte = resp.choices[0].message.content 
+            user_msg = (
+                f"{style_instructions[style]}\n\n"
+                "Voici les informations contextuelles sur la réunion :\n"
+                f"{meta_block}\n\n"
+                "Voici maintenant la transcription de la réunion. "
+                "Utilise les informations de contexte pour compléter les champs "
+                "comme la date, les participants, etc., sans laisser de champs vides :\n\n"
+                f"{transcript}"
+            )
 
-                st.subheader("📄 Compte rendu généré")
-                st.write(cr_texte)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
 
-                # Option : on stocke le CR dans la session pour réutilisation ultérieure (export, etc.)
-                st.session_state["meeting_summary"] = cr_texte
-                
-                st.download_button(
-                    label="Télécharger le compte rendu (Markdown)",
-                    data=cr_texte,
-                    file_name=f"compte_rendu_{uploaded_file.name.split('.')[0]}_CR.md",
-                    mime="text/markdown"
-                )
+            summary = resp.choices[0].message.content
+            st.session_state["summary"] = summary
 
-            except Exception as e:
-                st.error("❌ Erreur lors de la génération du compte rendu.")
-                st.error(f"Une erreur est survenue lors de l'appel à l'API GPT-4o-mini : {str(e)}")
+        st.subheader("📄 Compte rendu généré")
+        st.write(summary)
+
+        st.markdown("### 📥 Export")
+
+        # Exports avec métadonnées
+        docx_file = export_docx(summary, meta)
+        st.download_button(
+            "📄 Télécharger en DOCX",
+            data=docx_file,
+            file_name="compte_rendu_reunion.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        pdf_file = export_pdf(summary, meta)
+        st.download_button(
+            "📕 Télécharger en PDF",
+            data=pdf_file,
+            file_name="compte_rendu_reunion.pdf",
+            mime="application/pdf",
+        )
